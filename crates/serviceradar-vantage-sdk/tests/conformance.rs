@@ -189,6 +189,65 @@ impl FragmentStore for StubFragmentStore {
     }
 }
 
+fn resolve_negative_payload(
+    vec_root: &serde_json::Value,
+    neg: &serde_json::Value,
+) -> serde_json::Value {
+    if let Some(base_key) = neg.get("mutate_from").and_then(|v| v.as_str()) {
+        let mut base = vec_root
+            .get(base_key)
+            .unwrap_or_else(|| panic!("missing mutate_from '{base_key}'"))
+            .clone();
+        if let Some(patch) = neg.get("patch").and_then(|v| v.as_object()) {
+            for (dotted_key, val) in patch {
+                apply_dotted_patch(&mut base, dotted_key, val.clone());
+            }
+        }
+        base
+    } else {
+        neg.get("payload")
+            .unwrap_or_else(|| {
+                panic!(
+                    "negative vector {} missing payload and mutate_from",
+                    neg["name"]
+                )
+            })
+            .clone()
+    }
+}
+
+fn apply_dotted_patch(target: &mut serde_json::Value, dotted_path: &str, value: serde_json::Value) {
+    let parts: Vec<&str> = dotted_path.split('.').collect();
+    let mut cur = target;
+    for part in &parts[..parts.len() - 1] {
+        let map = cur.as_object_mut().unwrap_or_else(|| {
+            panic!("patch path '{dotted_path}' segment '{part}' is not an object")
+        });
+        cur = map
+            .entry((*part).to_string())
+            .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    }
+    let leaf = parts[parts.len() - 1];
+    cur.as_object_mut()
+        .unwrap_or_else(|| panic!("patch path '{dotted_path}' parent is not an object"))
+        .insert(leaf.to_string(), value);
+}
+
+fn assert_negative_error<T>(res: Result<T, VantageError>, neg: &serde_json::Value, kind: &str) {
+    let name = neg["name"].as_str().unwrap_or("<unnamed>");
+    let err = match res {
+        Ok(_) => panic!("negative {kind} '{name}' unexpectedly succeeded"),
+        Err(err) => err,
+    };
+    if let Some(expected) = neg.get("expected_error").and_then(|v| v.as_str()) {
+        let msg = err.to_string();
+        assert!(
+            msg.contains(expected),
+            "negative {kind} '{name}' error '{msg}' did not contain expected_error '{expected}'"
+        );
+    }
+}
+
 #[test]
 fn conformance_wire_vectors_roundtrip_and_negative_rejections() {
     assert_eq!(capability_slug("vantage.alpr.v1"), "vantage_alpr_v1");
@@ -211,11 +270,12 @@ fn conformance_wire_vectors_roundtrip_and_negative_rejections() {
         serde_json::from_value(job_vec["positive"].clone()).expect("valid job");
     job.to_bounded_json_bytes().expect("bounded job bytes");
     for neg in job_vec["negative"].as_array().expect("negative jobs") {
-        let parsed: Result<VantageJobEnvelope, _> = serde_json::from_value(neg["payload"].clone());
-        let ok = parsed
+        let payload = resolve_negative_payload(&job_vec, neg);
+        let parsed: Result<VantageJobEnvelope, _> = serde_json::from_value(payload);
+        let res = parsed
             .map(|j| j.to_bounded_json_bytes())
             .unwrap_or_else(|e| Err(VantageError::protocol(e.to_string())));
-        assert!(ok.is_err(), "negative job {} should fail", neg["name"]);
+        assert_negative_error(res, neg, "job");
     }
 
     // 2. vantage_result_v1
@@ -231,12 +291,12 @@ fn conformance_wire_vectors_roundtrip_and_negative_rejections() {
         .to_bounded_json_bytes()
         .expect("bounded live result");
     for neg in res_vec["negative"].as_array().expect("negative results") {
-        let parsed: Result<VantageResultEnvelope, _> =
-            serde_json::from_value(neg["payload"].clone());
-        let ok = parsed
+        let payload = resolve_negative_payload(&res_vec, neg);
+        let parsed: Result<VantageResultEnvelope, _> = serde_json::from_value(payload);
+        let res = parsed
             .map(|r| r.to_bounded_json_bytes())
             .unwrap_or_else(|e| Err(VantageError::protocol(e.to_string())));
-        assert!(ok.is_err(), "negative result {} should fail", neg["name"]);
+        assert_negative_error(res, neg, "result");
     }
 
     // 3. vantage_heartbeat_v1
@@ -245,16 +305,12 @@ fn conformance_wire_vectors_roundtrip_and_negative_rejections() {
         serde_json::from_value(hb_vec["positive"].clone()).expect("valid heartbeat");
     hb.validate().expect("heartbeat validates");
     for neg in hb_vec["negative"].as_array().expect("negative heartbeats") {
-        let parsed: Result<VantageWorkerHeartbeat, _> =
-            serde_json::from_value(neg["payload"].clone());
-        let ok = parsed
+        let payload = resolve_negative_payload(&hb_vec, neg);
+        let parsed: Result<VantageWorkerHeartbeat, _> = serde_json::from_value(payload);
+        let res = parsed
             .map(|h| h.validate())
             .unwrap_or_else(|e| Err(VantageError::protocol(e.to_string())));
-        assert!(
-            ok.is_err(),
-            "negative heartbeat {} should fail",
-            neg["name"]
-        );
+        assert_negative_error(res, neg, "heartbeat");
     }
 
     // 4. vantage_frame_v1 (both frame_jpeg_b64 and payload_format + payload_b64)
@@ -267,12 +323,12 @@ fn conformance_wire_vectors_roundtrip_and_negative_rejections() {
             .expect("positive payload_format frame");
     f_pf.validate().expect("positive payload_format validates");
     for neg in frame_vec["negative"].as_array().expect("negative frames") {
-        let parsed: Result<VantageLiveFrameEnvelope, _> =
-            serde_json::from_value(neg["payload"].clone());
-        let ok = parsed
+        let payload = resolve_negative_payload(&frame_vec, neg);
+        let parsed: Result<VantageLiveFrameEnvelope, _> = serde_json::from_value(payload);
+        let res = parsed
             .map(|f| f.validate().map(|_| ()))
             .unwrap_or_else(|e| Err(VantageError::protocol(e.to_string())));
-        assert!(ok.is_err(), "negative frame {} should fail", neg["name"]);
+        assert_negative_error(res, neg, "frame");
     }
 
     // 5. read_grant_response
@@ -284,15 +340,16 @@ fn conformance_wire_vectors_roundtrip_and_negative_rejections() {
         serde_json::from_value(rg_vec["positive_local"].clone()).expect("local grant");
     rg_loc.validate().expect("local grant validates");
     for neg in rg_vec["negative"].as_array().expect("negative grants") {
-        let parsed: Result<ReadGrantPlan, _> = serde_json::from_value(neg["payload"].clone());
-        let ok = parsed
-            .map(|g| g.validate())
+        let payload = resolve_negative_payload(&rg_vec, neg);
+        let parsed: Result<ReadGrantPlan, _> = serde_json::from_value(payload);
+        let res = parsed
+            .map(|g| {
+                let req =
+                    ReadGrantRequest::new(&g.job_id, &g.catalog_entry_id, &g.descriptor_sha256);
+                g.validate_for_request(&req)
+            })
             .unwrap_or_else(|e| Err(VantageError::protocol(e.to_string())));
-        assert!(
-            ok.is_err(),
-            "negative read grant {} should fail",
-            neg["name"]
-        );
+        assert_negative_error(res, neg, "read_grant");
     }
 
     // 6. Signal schemas presence & dual VantageUpstreamDetection deserialization
@@ -747,4 +804,148 @@ async fn http_probes_and_read_grants_410_gone_work_end_to_end() {
         .expect("410 should resolve cleanly");
     assert_eq!(res, GrantResolution::Gone);
     server_handle.join().expect("mock cp thread");
+}
+
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_keyframe_tap_custom_result_subject_run_until_one() {
+    use async_nats::jetstream;
+    use futures::StreamExt;
+
+    let probe_cmd = std::process::Command::new("nats-server")
+        .arg("--version")
+        .output();
+    if probe_cmd.is_err() {
+        eprintln!("skipping live nats-server test: nats-server not found on PATH");
+        return;
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind free port");
+    let port = listener.local_addr().expect("port").port();
+    drop(listener);
+
+    let js_dir = tempfile::tempdir().expect("js tempdir");
+    let child = std::process::Command::new("nats-server")
+        .arg("-js")
+        .arg("-a")
+        .arg("127.0.0.1")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-sd")
+        .arg(js_dir.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn nats-server");
+    let _guard = ChildGuard(child);
+
+    let nats_url = format!("nats://127.0.0.1:{port}");
+    let mut client_opt = None;
+    for _ in 0..40 {
+        if let Ok(c) = async_nats::connect(&nats_url).await {
+            client_opt = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let client = client_opt.expect("connect to ephemeral nats-server");
+    let js = jetstream::new(client.clone());
+    js.create_stream(jetstream::stream::Config {
+        name: "CAMERA_MEDIA_RESULTS".to_string(),
+        subjects: vec!["media.results.vantage.v1".to_string()],
+        ..Default::default()
+    })
+    .await
+    .expect("create CAMERA_MEDIA_RESULTS stream");
+
+    let live_subj = "media.live.vantage.vantage_probe_v1.v1";
+    let custom_out_subj = "media.results.vantage.probe.out";
+    let mut out_sub = client.subscribe(custom_out_subj).await.expect("subscribe");
+    client.flush().await.expect("flush");
+
+    let handler = RecordingHandler::new("vantage.probe.v1");
+    let invocations = handler.invocations.clone();
+    let cfg = WorkerConfig {
+        worker_id: "probe-custom-out-1".to_string(),
+        capabilities: vec!["vantage.probe.v1".to_string()],
+        supported_source_modes: vec![SourceMode::LiveKeyframeTap],
+        nats_url: Some(nats_url),
+        live_subject_override: Some(live_subj.to_string()),
+        result_subject: custom_out_subj.to_string(),
+        ..WorkerConfig::default()
+    };
+    let worker = Arc::new(VantageWorker::new(cfg, handler).expect("worker"));
+    let worker_task = tokio::spawn({
+        let w = Arc::clone(&worker);
+        async move { w.run_until_one().await }
+    });
+
+    // Wait for worker readiness, then allow subscription flush to settle
+    for _ in 0..40 {
+        if worker.readiness().is_ready() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(worker.readiness().is_ready(), "worker never became ready");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let rgb = RgbFrame::solid(64, 64, [20, 140, 220]);
+    let jpeg = encode_baseline_jpeg(&rgb, 80).expect("jpeg");
+    let frame_payload = serde_json::to_vec(&json!({
+        "schema_version": "vantage.frame.v1",
+        "source_mode": "live_keyframe_tap",
+        "camera_source_id": "22222222-2222-4222-8222-222222222204",
+        "stream_profile_id": "33333333-3333-4333-8333-333333333304",
+        "frame_sequence": 101,
+        "timeline_ts_us": 1700000101000000i64,
+        "time_basis": "received",
+        "catalog_entry_id": null,
+        "fragment_sequence": null,
+        "frame_jpeg_b64": base64::engine::general_purpose::STANDARD.encode(&jpeg),
+        "detections": [{
+            "track_id": "track-1",
+            "category": "vehicle",
+            "confidence": 0.91,
+            "bbox": [0.15, 0.25, 0.85, 0.85]
+        }]
+    }))
+    .expect("frame json");
+    client
+        .publish(live_subj, frame_payload.into())
+        .await
+        .expect("publish live frame");
+    client.flush().await.expect("flush publish");
+
+    let run_res = tokio::time::timeout(Duration::from_secs(5), worker_task)
+        .await
+        .unwrap_or_else(|e| {
+            let metrics = worker.metrics().render_prometheus_text().unwrap_or_default();
+            panic!(
+                "run_until_one must not hang on custom result_subject (invocations={}, ready={}): {e}\nmetrics:\n{metrics}",
+                invocations.load(Ordering::SeqCst),
+                worker.readiness().is_ready()
+            )
+        })
+        .expect("worker task join");
+    run_res.expect("run_until_one must succeed");
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+
+    let msg = tokio::time::timeout(Duration::from_secs(2), out_sub.next())
+        .await
+        .expect("result message timeout")
+        .expect("result message");
+    let result_env: VantageResultEnvelope =
+        serde_json::from_slice(&msg.payload).expect("valid VantageResultEnvelope");
+    assert_eq!(result_env.schema_version, "vantage.result.v1");
+    assert_eq!(result_env.source_mode, SourceMode::LiveKeyframeTap);
+    assert_eq!(result_env.observations.len(), 1);
+    assert_eq!(result_env.observations[0].label, "SR-0100");
 }

@@ -213,6 +213,13 @@ impl Default for CropPolicy {
 
 impl CropPolicy {
     pub fn validate(&self) -> Result<(), VantageError> {
+        if self.max_dimension == 0 || self.max_dimension > crate::crop::HARD_MAX_CROP_DIMENSION {
+            return Err(VantageError::invalid_configuration(format!(
+                "crop_policy.max_dimension {} must be in 1..={}",
+                self.max_dimension,
+                crate::crop::HARD_MAX_CROP_DIMENSION
+            )));
+        }
         self.to_crop_config().validate()
     }
 
@@ -863,11 +870,6 @@ impl VantageLiveFrameEnvelope {
                 self.source_mode
             )));
         }
-        if self.read_token.is_some() {
-            return Err(VantageError::protocol(
-                "live_keyframe_tap frame must not carry read_token",
-            ));
-        }
         if self.catalog_entry_id.is_some() {
             return Err(VantageError::protocol(
                 "live_keyframe_tap frame requires catalog_entry_id = null",
@@ -876,6 +878,11 @@ impl VantageLiveFrameEnvelope {
         if self.fragment_sequence.is_some() {
             return Err(VantageError::protocol(
                 "live_keyframe_tap frame requires fragment_sequence = null",
+            ));
+        }
+        if self.read_token.is_some() {
+            return Err(VantageError::protocol(
+                "live_keyframe_tap frame must not carry read_token",
             ));
         }
         for det in &self.detections {

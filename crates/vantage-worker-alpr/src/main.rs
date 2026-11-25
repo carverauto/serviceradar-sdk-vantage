@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use serviceradar_vantage_sdk::{
-    SourceMode, VantageError, VantageWorker, WorkerConfig, run_local_harness,
-};
+use serviceradar_vantage_sdk::{SourceMode, VantageError, VantageWorker, run_local_harness};
 use std::path::PathBuf;
-use vantage_worker_alpr::{AlprConfig, AlprWorkerHandler};
+use vantage_worker_alpr::{AlprWorkerHandler, LoadedAlprConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), VantageError> {
@@ -55,18 +53,19 @@ async fn main() -> Result<(), VantageError> {
         }
     }
 
-    let alpr_cfg = if let Some(path) = config_path {
-        let raw = std::fs::read_to_string(&path).map_err(|err| {
+    let raw_toml = if let Some(path) = config_path {
+        Some(std::fs::read_to_string(&path).map_err(|err| {
             VantageError::invalid_configuration(format!(
                 "failed reading config '{}': {err}",
                 path.display()
             ))
-        })?;
-        AlprConfig::from_toml_str(&raw)?
+        })?)
     } else {
-        AlprConfig::default()
+        None
     };
-    let handler = AlprWorkerHandler::new(alpr_cfg);
+
+    let loaded = LoadedAlprConfig::from_toml_and_env(raw_toml.as_deref())?;
+    let handler = AlprWorkerHandler::new(loaded.alpr);
 
     if let Some(clip) = harness_clip {
         let report = run_local_harness(clip, &handler, source_mode, schema_path.as_deref())?;
@@ -77,10 +76,6 @@ async fn main() -> Result<(), VantageError> {
         return Ok(());
     }
 
-    let mut config = WorkerConfig::from_env()?;
-    if std::env::var("VANTAGE_MODEL_ID").is_err() {
-        config.model_id = "vantage-alpr-synthetic-ocr".to_string();
-    }
-    let worker = VantageWorker::new(config, handler)?;
+    let worker = VantageWorker::new(loaded.worker, handler)?;
     worker.run().await
 }

@@ -502,6 +502,14 @@ impl VantageWorker {
             cfg.control_plane_auth = Some(serviceradar_vantage_sdk::WorkerAuthCredentials::new(
                 tok, deploy, generation,
             ));
+        } else if let Some(existing) = cfg.control_plane_auth.take() {
+            let deploy = deployment_ref.unwrap_or_else(|| existing.deployment_ref().to_string());
+            let generation = worker_generation.unwrap_or_else(|| existing.generation().to_string());
+            cfg.control_plane_auth = Some(serviceradar_vantage_sdk::WorkerAuthCredentials::new(
+                existing.token().to_string(),
+                deploy,
+                generation,
+            ));
         }
         if let Some(subj) = live_subject {
             cfg.live_subject_override = Some(subj);
@@ -539,6 +547,24 @@ impl VantageWorker {
     #[getter]
     fn capabilities(&self) -> Vec<String> {
         self.worker.config().capabilities.clone()
+    }
+
+    #[getter]
+    fn deployment_ref(&self) -> Option<&str> {
+        self.worker
+            .config()
+            .control_plane_auth
+            .as_ref()
+            .map(|c| c.deployment_ref())
+    }
+
+    #[getter]
+    fn worker_generation(&self) -> Option<&str> {
+        self.worker
+            .config()
+            .control_plane_auth
+            .as_ref()
+            .map(|c| c.generation())
     }
 
     fn run(&self, py: Python<'_>) -> PyResult<()> {

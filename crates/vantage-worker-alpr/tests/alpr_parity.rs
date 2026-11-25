@@ -9,8 +9,10 @@ use serviceradar_vantage_sdk::{
     SourceMode, VantageResultEnvelope, VantageWorker, WorkerConfig, run_local_harness,
     split_annex_b_nals, validate_baseline_jfif,
 };
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
-use vantage_worker_alpr::{AlprConfig, AlprWorkerHandler, is_valid_plate_text};
+use vantage_worker_alpr::{AlprConfig, AlprWorkerHandler, LoadedAlprConfig, is_valid_plate_text};
 
 fn vectors_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -156,5 +158,76 @@ async fn alpr_worker_processes_live_frame_with_synthetic_plate_override() {
     assert_eq!(
         res.observations[0].attributes["camera_label"],
         "Gate West 01"
+    );
+}
+
+#[test]
+fn alpr_config_loads_top_level_worker_fields_and_env_overrides() {
+    let cfg_raw = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml"),
+    )
+    .expect("config.example.toml");
+
+    let loaded = LoadedAlprConfig::from_toml_str(&cfg_raw).expect("load config.example.toml");
+    assert_eq!(loaded.worker.worker_id, "vantage-worker-alpr-gate-west-01");
+    assert_eq!(loaded.worker.capabilities, vec!["vantage.alpr.v1"]);
+    assert_eq!(
+        loaded.worker.supported_source_modes,
+        vec![SourceMode::RecordedBlock, SourceMode::LiveKeyframeTap]
+    );
+    assert_eq!(loaded.worker.execution_backend, "custom");
+    assert_eq!(loaded.worker.model_id, "vantage-alpr-synthetic-ocr");
+    assert_eq!(loaded.worker.model_version, "1.0.0");
+    assert_eq!(loaded.worker.max_concurrency, 4);
+    assert_eq!(
+        loaded.worker.nats_url.as_deref(),
+        Some("nats://192.0.2.10:4222")
+    );
+    assert_eq!(
+        loaded.worker.control_plane_url.as_deref(),
+        Some("https://192.0.2.20:4000")
+    );
+    assert_eq!(
+        loaded.worker.http_listen_addr,
+        Some("127.0.0.1:9091".parse::<SocketAddr>().unwrap())
+    );
+    assert_eq!(loaded.alpr.capability, "vantage.alpr.v1");
+    assert_eq!(loaded.alpr.signal_schema_id, "alpr_plate_read");
+    assert_eq!(loaded.alpr.default_region, "US-CO");
+    assert_eq!(loaded.alpr.default_camera_label, "Gate West 01");
+
+    // Verify explicit VANTAGE_* env overrides take precedence over TOML while preserving unset fields
+    let env_map: HashMap<&str, &str> = HashMap::from([
+        ("VANTAGE_WORKER_ID", "override-worker-02"),
+        ("VANTAGE_NATS_URL", "nats://192.0.2.99:4222"),
+        ("VANTAGE_MAX_CONCURRENCY", "8"),
+        (
+            "VANTAGE_CAPABILITIES",
+            "vantage.alpr.v1,vantage.alpr.custom.v1",
+        ),
+    ]);
+    let overridden = LoadedAlprConfig::from_toml_and_overrides(Some(&cfg_raw), |k| {
+        env_map.get(k).map(|v| (*v).to_string())
+    })
+    .expect("load with env overrides");
+
+    assert_eq!(overridden.worker.worker_id, "override-worker-02");
+    assert_eq!(
+        overridden.worker.nats_url.as_deref(),
+        Some("nats://192.0.2.99:4222")
+    );
+    assert_eq!(overridden.worker.max_concurrency, 8);
+    assert_eq!(
+        overridden.worker.capabilities,
+        vec!["vantage.alpr.v1", "vantage.alpr.custom.v1"]
+    );
+    // Unset env vars still preserve TOML values
+    assert_eq!(
+        overridden.worker.control_plane_url.as_deref(),
+        Some("https://192.0.2.20:4000")
+    );
+    assert_eq!(
+        overridden.worker.http_listen_addr,
+        Some("127.0.0.1:9091".parse::<SocketAddr>().unwrap())
     );
 }

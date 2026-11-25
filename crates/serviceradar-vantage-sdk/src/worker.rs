@@ -891,21 +891,48 @@ async fn publish_result_envelope(
     let mut headers = HeaderMap::new();
     headers.insert("Nats-Msg-Id", msg_id.as_str());
 
-    match js
+    if allow_core_fallback_on_custom_subject
+        && subject != VANTAGE_RESULTS_SUBJECT
+        && let Err(stream_err) = js.stream_by_subject(subject).await
+    {
+        debug!(
+            subject,
+            error = %stream_err,
+            "custom result_subject has no JetStream stream; publishing via core NATS"
+        );
+        client
+            .publish_with_headers(subject.to_string(), headers, bytes.into())
+            .await
+            .map_err(|pub_err| {
+                VantageError::nats(format!(
+                    "core NATS publish failed on '{subject}': {pub_err}"
+                ))
+            })?;
+        client
+            .flush()
+            .await
+            .map_err(|flush_err| VantageError::nats(format!("NATS flush failed: {flush_err}")))?;
+        return Ok(());
+    }
+
+    let js_res: Result<(), String> = match js
         .publish_with_headers(subject.to_string(), headers.clone(), bytes.clone().into())
         .await
     {
-        Ok(ack_fut) => {
-            ack_fut.await.map_err(|err| {
-                VantageError::nats(format!("JetStream PublishAck failed on '{subject}': {err}"))
-            })?;
-            Ok(())
-        }
+        Ok(ack_fut) => ack_fut
+            .await
+            .map(|_| ())
+            .map_err(|err| format!("JetStream PublishAck failed on '{subject}': {err}")),
+        Err(err) => Err(format!("JetStream publish failed on '{subject}': {err}")),
+    };
+
+    match js_res {
+        Ok(()) => Ok(()),
         Err(err) if allow_core_fallback_on_custom_subject && subject != VANTAGE_RESULTS_SUBJECT => {
             debug!(
                 subject,
                 error = %err,
-                "custom result_subject has no JetStream stream; falling back to core NATS publish"
+                "custom result_subject JetStream publish failed; falling back to core NATS publish"
             );
             client
                 .publish_with_headers(subject.to_string(), headers, bytes.into())
@@ -920,9 +947,7 @@ async fn publish_result_envelope(
             })?;
             Ok(())
         }
-        Err(err) => Err(VantageError::nats(format!(
-            "JetStream publish failed on '{subject}': {err}"
-        ))),
+        Err(err) => Err(VantageError::nats(err)),
     }
 }
 
@@ -1026,4 +1051,233 @@ fn unix_now_us() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO);
     i64::try_from(dur.as_micros()).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{VantageObservationInput, WorkerKind};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+    use uuid::Uuid;
+
+    fn sample_live_result() -> VantageResultEnvelope {
+        VantageResultEnvelope {
+            schema_version: VANTAGE_RESULT_SCHEMA_VERSION.to_string(),
+            job_id: None,
+            pack_id: "io.serviceradar.vantage-probe".to_string(),
+            pipeline_id: "io.serviceradar.vantage-probe.live".to_string(),
+            pipeline_version: "1.0.0".to_string(),
+            worker_kind: WorkerKind::ExternalRust,
+            worker_id: "worker-test-1".to_string(),
+            model_id: "probe-model".to_string(),
+            model_version: "1.0.0".to_string(),
+            capability: "vantage.probe.v1".to_string(),
+            source_mode: SourceMode::LiveKeyframeTap,
+            camera_source_id: Uuid::new_v4(),
+            stream_profile_id: Uuid::new_v4(),
+            catalog_entry_id: None,
+            descriptor_sha256: None,
+            observations: vec![VantageObservationInput {
+                observation_key: "a".repeat(64),
+                fragment_sequence: None,
+                frame_sequence: Some(1),
+                media_pts_ns: Some(0),
+                timeline_ts_us: 1_700_000_000_000_000,
+                time_basis: TimeBasis::Received,
+                track_id: Some("track-1".to_string()),
+                category: "license_plate".to_string(),
+                label: "SR-0100".to_string(),
+                confidence: 0.95,
+                bbox: Some([0.1, 0.2, 0.4, 0.6]),
+                crop_jpeg_b64: None,
+                attributes: serde_json::json!({"plate_text": "SR-0100"}),
+                signal_schema_id: "alpr_plate_read".to_string(),
+                signal_schema_version: "1.0.0".to_string(),
+                display_contract_id: "alpr_plate_read".to_string(),
+                search_text: Some("SR-0100".to_string()),
+            }],
+        }
+    }
+
+    async fn spawn_mock_no_stream_nats(
+        report_stream_present: bool,
+    ) -> (String, Arc<tokio::sync::Mutex<Vec<(String, bool)>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let published = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let published_clone = Arc::clone(&published);
+
+        tokio::spawn(async move {
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
+            let (reader, mut writer) = socket.into_split();
+            let info = format!(
+                "INFO {{\"server_id\":\"MOCK\",\"version\":\"2.12.0\",\"proto\":1,\"host\":\"127.0.0.1\",\"port\":{port},\"headers\":true,\"max_payload\":1048576,\"jetstream\":true}}\r\n"
+            );
+            if writer.write_all(info.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = writer.flush().await;
+
+            let mut buf_reader = BufReader::new(reader);
+            let mut sub_sid: Option<(String, String)> = None;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let Ok(n) = buf_reader.read_line(&mut line).await else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                let trimmed = line.trim_end_matches(['\r', '\n']);
+                if trimmed == "PING" {
+                    let _ = writer.write_all(b"PONG\r\n").await;
+                    let _ = writer.flush().await;
+                } else if let Some(rest) = trimmed.strip_prefix("SUB ") {
+                    let parts: Vec<&str> = rest.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let subj_prefix = parts[0].trim_end_matches('*').to_string();
+                        let sid = parts.last().unwrap().to_string();
+                        sub_sid = Some((subj_prefix, sid));
+                    }
+                } else if let Some(rest) = trimmed.strip_prefix("PUB ") {
+                    let parts: Vec<&str> = rest.split_whitespace().collect();
+                    let (subject, reply_to, total_len) = match parts.as_slice() {
+                        [subj, tot] => ((*subj).to_string(), None, *tot),
+                        [subj, reply, tot] => {
+                            ((*subj).to_string(), Some((*reply).to_string()), *tot)
+                        }
+                        _ => continue,
+                    };
+                    let total_bytes: usize = total_len.parse().unwrap_or(0);
+                    let mut body = vec![0u8; total_bytes + 2];
+                    if buf_reader.read_exact(&mut body).await.is_err() {
+                        break;
+                    }
+                    if subject == "$JS.API.STREAM.NAMES"
+                        && let (Some(reply), Some((_prefix, sid))) = (reply_to, &sub_sid)
+                    {
+                        let payload = if report_stream_present {
+                            b"{\"type\":\"io.nats.jetstream.api.v1.stream_names_response\",\"total\":1,\"offset\":0,\"limit\":1024,\"streams\":[\"CUSTOM_STREAM\"]}".to_vec()
+                        } else {
+                            b"{\"type\":\"io.nats.jetstream.api.v1.stream_names_response\",\"total\":0,\"offset\":0,\"limit\":1024,\"streams\":null}".to_vec()
+                        };
+                        let msg = format!("MSG {reply} {sid} {}\r\n", payload.len());
+                        let _ = writer.write_all(msg.as_bytes()).await;
+                        let _ = writer.write_all(&payload).await;
+                        let _ = writer.write_all(b"\r\n").await;
+                        let _ = writer.flush().await;
+                    }
+                } else if let Some(rest) = trimmed.strip_prefix("HPUB ") {
+                    let parts: Vec<&str> = rest.split_whitespace().collect();
+                    let (subject, reply_to, total_len) = match parts.as_slice() {
+                        [subj, _hdr_len, tot] => ((*subj).to_string(), None, *tot),
+                        [subj, reply, _hdr_len, tot] => {
+                            ((*subj).to_string(), Some((*reply).to_string()), *tot)
+                        }
+                        _ => continue,
+                    };
+                    let total_bytes: usize = total_len.parse().unwrap_or(0);
+                    let mut body = vec![0u8; total_bytes + 2];
+                    if buf_reader.read_exact(&mut body).await.is_err() {
+                        break;
+                    }
+                    let has_reply = reply_to.is_some();
+                    published_clone.lock().await.push((subject, has_reply));
+                    if let (Some(reply), Some((_prefix, sid))) = (reply_to, &sub_sid) {
+                        let hdr = b"NATS/1.0 503 No Responders\r\n\r\n";
+                        let hmsg = format!("HMSG {reply} {sid} {} {}\r\n", hdr.len(), hdr.len());
+                        let _ = writer.write_all(hmsg.as_bytes()).await;
+                        let _ = writer.write_all(hdr).await;
+                        let _ = writer.write_all(b"\r\n").await;
+                        let _ = writer.flush().await;
+                    }
+                }
+            }
+        });
+
+        (format!("nats://127.0.0.1:{port}"), published)
+    }
+
+    #[tokio::test]
+    async fn publish_result_envelope_falls_back_on_ack_503_for_custom_subject_only() {
+        let (nats_url, published) = spawn_mock_no_stream_nats(true).await;
+        let cfg = WorkerConfig::default();
+        let (client, js) = connect_nats_and_jetstream(&cfg, &nats_url)
+            .await
+            .expect("connect");
+        let env = sample_live_result();
+
+        // 1. Custom subject when stream exists initially, then ack_fut returns 503 -> falls back to core NATS
+        publish_result_envelope(&js, &client, "media.results.vantage.probe.out", &env, true)
+            .await
+            .expect("custom result_subject must fall back to core NATS");
+        for _ in 0..50 {
+            if published.lock().await.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        {
+            let log = published.lock().await;
+            assert_eq!(
+                log.as_slice(),
+                &[
+                    ("media.results.vantage.probe.out".to_string(), true),
+                    ("media.results.vantage.probe.out".to_string(), false),
+                ]
+            );
+        }
+        published.lock().await.clear();
+
+        // 2. Default VANTAGE_RESULTS_SUBJECT must NOT fall back even when allow_core_fallback=true
+        let err = publish_result_envelope(&js, &client, VANTAGE_RESULTS_SUBJECT, &env, true)
+            .await
+            .expect_err("default VANTAGE_RESULTS_SUBJECT must require JetStream PublishAck");
+        assert!(matches!(err.kind(), VantageErrorKind::Nats(_)));
+        assert_eq!(
+            published.lock().await.as_slice(),
+            &[(VANTAGE_RESULTS_SUBJECT.to_string(), true)]
+        );
+        published.lock().await.clear();
+
+        // 3. Custom subject with allow_core_fallback=false (recorded_block) must NOT fall back
+        let err_rec =
+            publish_result_envelope(&js, &client, "media.results.vantage.probe.out", &env, false)
+                .await
+                .expect_err("recorded_block must require JetStream PublishAck");
+        assert!(matches!(err_rec.kind(), VantageErrorKind::Nats(_)));
+        assert_eq!(
+            published.lock().await.as_slice(),
+            &[("media.results.vantage.probe.out".to_string(), true)]
+        );
+
+        // 4. Custom subject when no JetStream stream matches goes straight to core NATS (no double-send or Ack hang)
+        let (nats_url_no_stream, published_no_stream) = spawn_mock_no_stream_nats(false).await;
+        let (client2, js2) = connect_nats_and_jetstream(&cfg, &nats_url_no_stream)
+            .await
+            .expect("connect 2");
+        publish_result_envelope(
+            &js2,
+            &client2,
+            "media.results.vantage.probe.out",
+            &env,
+            true,
+        )
+        .await
+        .expect("custom subject without stream publishes directly to core NATS");
+        for _ in 0..50 {
+            if !published_no_stream.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            published_no_stream.lock().await.as_slice(),
+            &[("media.results.vantage.probe.out".to_string(), false)]
+        );
+    }
 }

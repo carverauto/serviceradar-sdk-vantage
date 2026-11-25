@@ -86,13 +86,28 @@ impl Default for WorkerConfig {
 impl WorkerConfig {
     pub fn from_env() -> Result<Self, VantageError> {
         let mut cfg = Self::default();
+        cfg.apply_env_overrides()?;
+        Ok(cfg)
+    }
 
-        if let Some(id) = non_empty_env("VANTAGE_WORKER_ID") {
-            cfg.worker_id = id;
+    pub fn apply_env_overrides(&mut self) -> Result<(), VantageError> {
+        self.apply_overrides_with(non_empty_env)
+    }
+
+    pub fn apply_overrides_with<F>(&mut self, get_var: F) -> Result<(), VantageError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let get = |name: &str| {
+            get_var(name)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+
+        if let Some(id) = get("VANTAGE_WORKER_ID") {
+            self.worker_id = id;
         }
-        if let Some(caps_raw) =
-            non_empty_env("VANTAGE_CAPABILITIES").or_else(|| non_empty_env("VANTAGE_CAPABILITY"))
-        {
+        if let Some(caps_raw) = get("VANTAGE_CAPABILITIES").or_else(|| get("VANTAGE_CAPABILITY")) {
             let caps: Vec<String> = caps_raw
                 .split(',')
                 .map(str::trim)
@@ -104,9 +119,9 @@ impl WorkerConfig {
                     "VANTAGE_CAPABILITIES must not be empty",
                 ));
             }
-            cfg.capabilities = caps;
+            self.capabilities = caps;
         }
-        if let Some(modes_raw) = non_empty_env("VANTAGE_SUPPORTED_SOURCE_MODES") {
+        if let Some(modes_raw) = get("VANTAGE_SUPPORTED_SOURCE_MODES") {
             let mut modes = Vec::new();
             for item in modes_raw
                 .split(',')
@@ -120,84 +135,121 @@ impl WorkerConfig {
                     "VANTAGE_SUPPORTED_SOURCE_MODES must not be empty",
                 ));
             }
-            cfg.supported_source_modes = modes;
+            self.supported_source_modes = modes;
         }
-        if let Some(backend) = non_empty_env("VANTAGE_EXECUTION_BACKEND") {
-            cfg.execution_backend = backend;
+        if let Some(backend) = get("VANTAGE_EXECUTION_BACKEND") {
+            self.execution_backend = backend;
         }
-        if let Some(model_id) = non_empty_env("VANTAGE_MODEL_ID") {
-            cfg.model_id = model_id;
+        if let Some(model_id) = get("VANTAGE_MODEL_ID") {
+            self.model_id = model_id;
         }
-        if let Some(model_ver) = non_empty_env("VANTAGE_MODEL_VERSION") {
-            cfg.model_version = model_ver;
+        if let Some(model_ver) = get("VANTAGE_MODEL_VERSION") {
+            self.model_version = model_ver;
         }
-        if let Some(conc) = non_empty_env("VANTAGE_MAX_CONCURRENCY") {
-            cfg.max_concurrency = conc.parse::<u32>().map_err(|err| {
+        if let Some(conc) = get("VANTAGE_MAX_CONCURRENCY") {
+            self.max_concurrency = conc.parse::<u32>().map_err(|err| {
                 VantageError::invalid_configuration(format!(
                     "invalid VANTAGE_MAX_CONCURRENCY '{conc}': {err}"
                 ))
             })?;
         }
 
-        cfg.nats_url = non_empty_env("VANTAGE_NATS_URL")
-            .or_else(|| non_empty_env("SERVICERADAR_E2E_NATS_URL"))
-            .or_else(|| non_empty_env("NATS_URL"));
-        cfg.nats_creds_file = non_empty_env("VANTAGE_NATS_CREDS_FILE").map(PathBuf::from);
-        cfg.nats_tls_ca_file = non_empty_env("VANTAGE_NATS_TLS_CA_FILE").map(PathBuf::from);
-        cfg.nats_tls_cert_file = non_empty_env("VANTAGE_NATS_TLS_CERT_FILE").map(PathBuf::from);
-        cfg.nats_tls_key_file = non_empty_env("VANTAGE_NATS_TLS_KEY_FILE").map(PathBuf::from);
-
-        if let Some(s) = non_empty_env("VANTAGE_JOBS_STREAM") {
-            cfg.jobs_stream_name = s;
+        if let Some(url) = get("VANTAGE_NATS_URL")
+            .or_else(|| get("SERVICERADAR_E2E_NATS_URL"))
+            .or_else(|| get("NATS_URL"))
+        {
+            self.nats_url = Some(url);
         }
-        if let Some(s) = non_empty_env("VANTAGE_RESULTS_STREAM") {
-            cfg.results_stream_name = s;
+        if let Some(p) = get("VANTAGE_NATS_CREDS_FILE").map(PathBuf::from) {
+            self.nats_creds_file = Some(p);
         }
-        cfg.live_subject_override = non_empty_env("VANTAGE_LIVE_SUBJECT");
-        if let Some(s) = non_empty_env("VANTAGE_RESULT_SUBJECT") {
-            cfg.result_subject = s;
+        if let Some(p) = get("VANTAGE_NATS_TLS_CA_FILE").map(PathBuf::from) {
+            self.nats_tls_ca_file = Some(p);
+        }
+        if let Some(p) = get("VANTAGE_NATS_TLS_CERT_FILE").map(PathBuf::from) {
+            self.nats_tls_cert_file = Some(p);
+        }
+        if let Some(p) = get("VANTAGE_NATS_TLS_KEY_FILE").map(PathBuf::from) {
+            self.nats_tls_key_file = Some(p);
         }
 
-        cfg.control_plane_url = non_empty_env("VANTAGE_CONTROL_PLANE_URL")
-            .or_else(|| non_empty_env("SERVICERADAR_E2E_WEB_URL"));
+        if let Some(s) = get("VANTAGE_JOBS_STREAM") {
+            self.jobs_stream_name = s;
+        }
+        if let Some(s) = get("VANTAGE_RESULTS_STREAM") {
+            self.results_stream_name = s;
+        }
+        if let Some(s) = get("VANTAGE_LIVE_SUBJECT") {
+            self.live_subject_override = Some(s);
+        }
+        if let Some(s) = get("VANTAGE_RESULT_SUBJECT") {
+            self.result_subject = s;
+        }
 
-        if let Some(token) = non_empty_env("VANTAGE_CONTROL_PLANE_AUTH") {
-            let deploy_ref = non_empty_env("VANTAGE_DEPLOYMENT_REF")
+        if let Some(url) =
+            get("VANTAGE_CONTROL_PLANE_URL").or_else(|| get("SERVICERADAR_E2E_WEB_URL"))
+        {
+            self.control_plane_url = Some(url);
+        }
+
+        if let Some(token) = get("VANTAGE_CONTROL_PLANE_AUTH") {
+            let deploy_ref = get("VANTAGE_DEPLOYMENT_REF")
                 .unwrap_or_else(|| "00000000-0000-4000-8000-000000000000".to_string());
-            let generation =
-                non_empty_env("VANTAGE_WORKER_GENERATION").unwrap_or_else(|| "1".to_string());
-            cfg.control_plane_auth =
+            let generation = get("VANTAGE_WORKER_GENERATION").unwrap_or_else(|| "1".to_string());
+            self.control_plane_auth =
                 Some(WorkerAuthCredentials::new(token, deploy_ref, generation));
+        } else if let Some(existing) = self.control_plane_auth.take() {
+            let deploy_ref = get("VANTAGE_DEPLOYMENT_REF")
+                .unwrap_or_else(|| existing.deployment_ref().to_string());
+            let generation = get("VANTAGE_WORKER_GENERATION")
+                .unwrap_or_else(|| existing.generation().to_string());
+            self.control_plane_auth = Some(WorkerAuthCredentials::new(
+                existing.token().to_string(),
+                deploy_ref,
+                generation,
+            ));
         }
 
-        if let Some(addr_raw) = non_empty_env("VANTAGE_HTTP_LISTEN_ADDR") {
+        if let Some(addr_raw) = get("VANTAGE_HTTP_LISTEN_ADDR") {
             let addr: SocketAddr = addr_raw.parse().map_err(|err| {
                 VantageError::invalid_configuration(format!(
                     "invalid VANTAGE_HTTP_LISTEN_ADDR '{addr_raw}': {err}"
                 ))
             })?;
-            cfg.http_listen_addr = Some(addr);
+            self.http_listen_addr = Some(addr);
         }
 
-        if let Some(scheme) = non_empty_env("VANTAGE_NVR_SCHEME") {
-            cfg.nvr_scheme = scheme;
+        if let Some(scheme) = get("VANTAGE_NVR_SCHEME") {
+            self.nvr_scheme = scheme;
         }
-        if let Some(port) = non_empty_env("VANTAGE_NVR_PORT") {
-            cfg.nvr_port = port.parse::<u16>().map_err(|err| {
+        if let Some(port) = get("VANTAGE_NVR_PORT") {
+            self.nvr_port = port.parse::<u16>().map_err(|err| {
                 VantageError::invalid_configuration(format!(
                     "invalid VANTAGE_NVR_PORT '{port}': {err}"
                 ))
             })?;
         }
-        cfg.nvr_host_suffix = non_empty_env("VANTAGE_NVR_HOST_SUFFIX");
-        cfg.nvr_tls_ca_file = non_empty_env("VANTAGE_NVR_TLS_CA_FILE").map(PathBuf::from);
-        cfg.nvr_tls_cert_file = non_empty_env("VANTAGE_NVR_TLS_CERT_FILE").map(PathBuf::from);
-        cfg.nvr_tls_key_file = non_empty_env("VANTAGE_NVR_TLS_KEY_FILE").map(PathBuf::from);
-        cfg.nvr_auth_token_file = non_empty_env("VANTAGE_NVR_AUTH_TOKEN_FILE").map(PathBuf::from);
-        cfg.nvr_explicit_base_url = non_empty_env("VANTAGE_NVR_BASE_URL");
+        if let Some(s) = get("VANTAGE_NVR_HOST_SUFFIX") {
+            self.nvr_host_suffix = Some(s);
+        }
+        if let Some(p) = get("VANTAGE_NVR_TLS_CA_FILE").map(PathBuf::from) {
+            self.nvr_tls_ca_file = Some(p);
+        }
+        if let Some(p) = get("VANTAGE_NVR_TLS_CERT_FILE").map(PathBuf::from) {
+            self.nvr_tls_cert_file = Some(p);
+        }
+        if let Some(p) = get("VANTAGE_NVR_TLS_KEY_FILE").map(PathBuf::from) {
+            self.nvr_tls_key_file = Some(p);
+        }
+        if let Some(p) = get("VANTAGE_NVR_AUTH_TOKEN_FILE").map(PathBuf::from) {
+            self.nvr_auth_token_file = Some(p);
+        }
+        if let Some(url) = get("VANTAGE_NVR_BASE_URL") {
+            self.nvr_explicit_base_url = Some(url);
+        }
 
-        cfg.validate()?;
-        Ok(cfg)
+        self.validate()?;
+        Ok(())
     }
 
     pub fn capabilities_manifest(&self) -> WorkerCapabilities {

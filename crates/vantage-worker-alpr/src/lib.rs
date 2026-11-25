@@ -7,9 +7,10 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serviceradar_vantage_sdk::{
-    CropConfig, CropOutcome, ObservationOutput, RgbFrame, VantageError, VantageFrameContext,
-    VantageHandler, clamp_unit_bbox, crop_detection_jpeg,
+    CropConfig, CropOutcome, ObservationOutput, RgbFrame, SourceMode, VantageError,
+    VantageFrameContext, VantageHandler, WorkerConfig, clamp_unit_bbox, crop_detection_jpeg,
 };
+use std::net::SocketAddr;
 
 pub const ALPR_CAPABILITY: &str = "vantage.alpr.v1";
 pub const ALPR_SIGNAL_SCHEMA_ID: &str = "alpr_plate_read";
@@ -44,6 +45,38 @@ impl Default for AlprConfig {
 #[derive(Deserialize)]
 struct ConfigFileDoc {
     #[serde(default)]
+    worker_id: Option<String>,
+    #[serde(default)]
+    capability: Option<String>,
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
+    #[serde(default)]
+    supported_source_modes: Option<Vec<String>>,
+    #[serde(default)]
+    execution_backend: Option<String>,
+    #[serde(default)]
+    model_id: Option<String>,
+    #[serde(default)]
+    model_version: Option<String>,
+    #[serde(default)]
+    max_concurrency: Option<u32>,
+    #[serde(default)]
+    nats_url: Option<String>,
+    #[serde(default)]
+    control_plane_url: Option<String>,
+    #[serde(default)]
+    http_listen_addr: Option<String>,
+    #[serde(default)]
+    jobs_stream_name: Option<String>,
+    #[serde(default)]
+    results_stream_name: Option<String>,
+    #[serde(default)]
+    live_subject: Option<String>,
+    #[serde(default)]
+    result_subject: Option<String>,
+    #[serde(default)]
+    heartbeat_interval_ms: Option<u64>,
+    #[serde(default)]
     alpr: Option<AlprTomlSection>,
 }
 
@@ -57,33 +90,191 @@ struct AlprTomlSection {
     min_confidence: Option<f32>,
 }
 
-impl AlprConfig {
+#[derive(Debug, Clone)]
+pub struct LoadedAlprConfig {
+    pub worker: WorkerConfig,
+    pub alpr: AlprConfig,
+}
+
+impl LoadedAlprConfig {
     pub fn from_toml_str(raw: &str) -> Result<Self, VantageError> {
-        let doc: ConfigFileDoc = toml::from_str(raw).map_err(|err| {
-            VantageError::invalid_configuration(format!("invalid ALPR TOML config: {err}"))
-        })?;
-        let mut cfg = Self::default();
-        if let Some(sec) = doc.alpr {
-            if let Some(v) = sec.signal_schema_id {
-                cfg.signal_schema_id = v;
+        Self::from_toml_and_overrides(Some(raw), |_| None)
+    }
+
+    pub fn from_toml_and_env(raw: Option<&str>) -> Result<Self, VantageError> {
+        Self::from_toml_and_overrides(raw, |key| std::env::var(key).ok())
+    }
+
+    pub fn from_toml_and_overrides<F>(raw: Option<&str>, get_var: F) -> Result<Self, VantageError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let mut worker = WorkerConfig {
+            model_id: "vantage-alpr-synthetic-ocr".to_string(),
+            ..WorkerConfig::default()
+        };
+        let mut alpr = AlprConfig::default();
+
+        if let Some(toml_raw) = raw {
+            let doc: ConfigFileDoc = toml::from_str(toml_raw).map_err(|err| {
+                VantageError::invalid_configuration(format!("invalid ALPR TOML config: {err}"))
+            })?;
+
+            if let Some(v) = doc
+                .worker_id
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                worker.worker_id = v;
             }
-            if let Some(v) = sec.signal_schema_version {
-                cfg.signal_schema_version = v;
+            if let Some(caps) = doc.capabilities {
+                let cleaned: Vec<String> = caps
+                    .into_iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if cleaned.is_empty() {
+                    return Err(VantageError::invalid_configuration(
+                        "capabilities in TOML config must not be empty",
+                    ));
+                }
+                alpr.capability = cleaned[0].clone();
+                worker.capabilities = cleaned;
+            } else if let Some(cap) = doc
+                .capability
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                alpr.capability = cap.clone();
+                worker.capabilities = vec![cap];
             }
-            if let Some(v) = sec.display_contract_id {
-                cfg.display_contract_id = v;
+            if let Some(modes_raw) = doc.supported_source_modes {
+                let mut modes = Vec::with_capacity(modes_raw.len());
+                for item in modes_raw {
+                    modes.push(SourceMode::parse(&item)?);
+                }
+                if modes.is_empty() {
+                    return Err(VantageError::invalid_configuration(
+                        "supported_source_modes in TOML config must not be empty",
+                    ));
+                }
+                worker.supported_source_modes = modes;
             }
-            if let Some(v) = sec.default_region {
-                cfg.default_region = v;
+            if let Some(v) = doc
+                .execution_backend
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                worker.execution_backend = v;
             }
-            if let Some(v) = sec.default_camera_label {
-                cfg.default_camera_label = v;
+            if let Some(v) = doc
+                .model_id
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                worker.model_id = v;
             }
-            if let Some(v) = sec.min_confidence {
-                cfg.min_confidence = v;
+            if let Some(v) = doc
+                .model_version
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                worker.model_version = v;
+            }
+            if let Some(v) = doc.max_concurrency {
+                worker.max_concurrency = v;
+            }
+            if let Some(v) = doc
+                .nats_url
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                worker.nats_url = Some(v);
+            }
+            if let Some(v) = doc
+                .control_plane_url
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                worker.control_plane_url = Some(v);
+            }
+            if let Some(addr_raw) = doc
+                .http_listen_addr
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                let addr: SocketAddr = addr_raw.parse().map_err(|err| {
+                    VantageError::invalid_configuration(format!(
+                        "invalid http_listen_addr '{addr_raw}' in TOML config: {err}"
+                    ))
+                })?;
+                worker.http_listen_addr = Some(addr);
+            }
+            if let Some(v) = doc
+                .jobs_stream_name
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                worker.jobs_stream_name = v;
+            }
+            if let Some(v) = doc
+                .results_stream_name
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                worker.results_stream_name = v;
+            }
+            if let Some(v) = doc
+                .live_subject
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                worker.live_subject_override = Some(v);
+            }
+            if let Some(v) = doc
+                .result_subject
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                worker.result_subject = v;
+            }
+            if let Some(v) = doc.heartbeat_interval_ms {
+                worker.heartbeat_interval_ms = v;
+            }
+
+            if let Some(sec) = doc.alpr {
+                if let Some(v) = sec.signal_schema_id {
+                    alpr.signal_schema_id = v;
+                }
+                if let Some(v) = sec.signal_schema_version {
+                    alpr.signal_schema_version = v;
+                }
+                if let Some(v) = sec.display_contract_id {
+                    alpr.display_contract_id = v;
+                }
+                if let Some(v) = sec.default_region {
+                    alpr.default_region = v;
+                }
+                if let Some(v) = sec.default_camera_label {
+                    alpr.default_camera_label = v;
+                }
+                if let Some(v) = sec.min_confidence {
+                    alpr.min_confidence = v;
+                }
             }
         }
-        Ok(cfg)
+
+        worker.apply_overrides_with(get_var)?;
+        if let Some(primary) = worker.capabilities.first() {
+            alpr.capability = primary.clone();
+        }
+        Ok(Self { worker, alpr })
+    }
+}
+
+impl AlprConfig {
+    pub fn from_toml_str(raw: &str) -> Result<Self, VantageError> {
+        Ok(LoadedAlprConfig::from_toml_str(raw)?.alpr)
     }
 }
 
