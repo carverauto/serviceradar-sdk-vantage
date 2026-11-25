@@ -1,0 +1,35 @@
+[package]
+name = "serviceradar-vantage-sdk"
+version = "0.1.0"
+description = "Apache-2.0 Rust SDK for ServiceRadar Vantage external computer-vision workers (vantage.worker.v1)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-nats = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+parking_lot = { workspace = true }
+prometheus = { workspace = true }
+rustls = { workspace = true }
+rusty_h264-decoder = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+ureq = { workspace = true }
+uuid = { workspace = true }
+zeroize = { workspace = true }
+zune-jpeg = { workspace = true }
+
+[dev-dependencies]
+rusty_h264-common = { workspace = true }
+rusty_h264-encoder = { workspace = true }
+tempfile = { workspace = true }

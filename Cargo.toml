@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/serviceradar-vantage-sdk",
+    "crates/vantage-worker-alpr",
+    "python",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.98.0"
+license = "Apache-2.0"
+repository = "https://github.com/carverauto/serviceradar-sdk-vantage"
+
+[workspace.dependencies]
+async-nats = "0.53.0"
+axum = "0.8"
+base64 = "0.22"
+bytes = "1"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+hex = "0.4"
+parking_lot = "0.12"
+prometheus = { version = "0.14", features = ["protobuf"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
+# Default features install a process-wide #[global_allocator]; keep disabled for workers & PyO3 cdylib.
+rusty_h264-common = { version = "=0.17.3", default-features = false, features = ["std"] }
+rusty_h264-decoder = { version = "=0.17.3", default-features = false, features = ["std", "asm"] }
+rusty_h264-encoder = { version = "=0.17.3", default-features = false, features = ["std"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.11"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ureq = { version = "3.3", features = ["json"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+zeroize = { version = "1", features = ["alloc"] }
+zune-jpeg = "0.5"

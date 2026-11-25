@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+          - os: macos-latest
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+      - name: Verify permissive dependency licenses
+        run: |
+          python3 - <<'PY'
+          import json, subprocess
+          meta = json.loads(subprocess.check_output(["cargo", "metadata", "--format-version=1", "--locked"]))
+          forbidden = ("GPL", "AGPL", "LGPL", "PROPRIETARY", "UNLICENSED", "IJG", "OPENALPR")
+          for pkg in meta["packages"]:
+              if pkg.get("source") is None:
+                  assert pkg.get("license") == "Apache-2.0", f"workspace crate {pkg['name']} license {pkg.get('license')}"
+                  continue
+              lic = (pkg.get("license") or "").upper()
+              assert lic, f"missing license on {pkg['name']}"
+              # For disjunctive SPDX (`A OR B`), at least one option must be free of forbidden terms.
+              options = [opt.strip() for opt in lic.replace("(", " ").replace(")", " ").split(" OR ")]
+              permissive_ok = any(not any(bad in opt for bad in forbidden) for opt in options)
+              assert permissive_ok, f"forbidden license {lic!r} in {pkg['name']}"
+              assert "OPENALPR" not in pkg["name"].upper(), f"forbidden crate {pkg['name']}"
+          print(f"Verified {len(meta['packages'])} packages have permissive licenses")
+          PY
+
+  python:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
+          - os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install maturin, pytest, numpy
+        run: python -m pip install --upgrade pip maturin pytest numpy
+      - name: Build wheel and develop install
+        run: |
+          maturin build --manifest-path python/Cargo.toml --out dist
+          maturin develop --manifest-path python/Cargo.toml
+      - name: Run Python SDK tests
+        run: python -m pytest python/tests -v

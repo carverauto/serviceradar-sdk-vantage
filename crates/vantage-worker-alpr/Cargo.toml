@@ -1,0 +1,24 @@
+[package]
+name = "vantage-worker-alpr"
+version = "0.1.0"
+description = "Permissive Apache-2.0 reference ALPR Vantage worker (vantage.alpr.v1)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serviceradar-vantage-sdk = { path = "../serviceradar-vantage-sdk" }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+rusty_h264-common = { workspace = true }
+rusty_h264-encoder = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }

@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# Synthetic reference configuration for vantage-worker-alpr (zero DB/S3 credentials).
+
+worker_id = "vantage-worker-alpr-gate-west-01"
+capability = "vantage.alpr.v1"
+supported_source_modes = ["recorded_block", "live_keyframe_tap"]
+execution_backend = "custom"
+model_id = "vantage-alpr-synthetic-ocr"
+model_version = "1.0.0"
+max_concurrency = 4
+nats_url = "nats://192.0.2.10:4222"
+control_plane_url = "https://192.0.2.20:4000"
+http_listen_addr = "127.0.0.1:9091"
+
+[alpr]
+signal_schema_id = "alpr_plate_read"
+signal_schema_version = "1.0.0"
+display_contract_id = "alpr_plate_read"
+default_region = "US-CO"
+default_camera_label = "Gate West 01"
+min_confidence = 0.55

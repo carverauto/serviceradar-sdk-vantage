@@ -1,0 +1,23 @@
+# Rust / Cargo
+/target
+**/target
+**/*.rs.bk
+*.pdb
+**/mutants.out*/
+
+# Python / Maturin
+*.so
+*.pyd
+*.dylib
+*.egg-info/
+dist/
+build/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# OS / Editor
+.DS_Store
+.idea/
+.vscode/
